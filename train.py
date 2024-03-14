@@ -31,6 +31,9 @@ from models import DiT_models
 from diffusion import create_diffusion
 import torch.nn.functional as F
 from diffusers.models import AutoencoderKL
+from diffusion.resample import t_sample
+from torchvision.utils import save_image
+from torchvision.datasets import VisionDataset
 
 
 #################################################################################
@@ -82,6 +85,167 @@ def create_logger(logging_dir):
         logger.addHandler(logging.NullHandler())
     return logger
 
+from typing import Optional, Callable, Any, Tuple, Dict, List, Union, cast
+import moxing as mox
+
+def has_file_allowed_extension(filename: str, extensions: Union[str, Tuple[str, ...]]) -> bool:
+    return filename.lower().endswith(extensions if isinstance(extensions, str) else tuple(extensions))
+
+IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".ppm", ".bmp", ".pgm", ".tif", ".tiff", ".webp")
+def is_image_file(filename: str) -> bool:
+    return has_file_allowed_extension(filename, IMG_EXTENSIONS)
+
+
+def find_classes(directory: str) -> Tuple[List[str], Dict[str, int]]:
+    """Finds the class folders in a dataset.
+
+    See :class:`DatasetFolder` for details.
+    """
+    classes = sorted(entry.name for entry in mox.file.scan_dir(directory) if entry.is_dir())
+    if not classes:
+        raise FileNotFoundError(f"Couldn't find any class folder in {directory}.")
+
+    class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
+    return classes, class_to_idx
+
+
+def make_dataset(
+    directory: str,
+    class_to_idx: Optional[Dict[str, int]] = None,
+    extensions: Optional[Union[str, Tuple[str, ...]]] = None,
+    is_valid_file: Optional[Callable[[str], bool]] = None,
+) -> List[Tuple[str, int]]:
+    """Generates a list of samples of a form (path_to_sample, class).
+
+    See :class:`DatasetFolder` for details.
+
+    Note: The class_to_idx parameter is here optional and will use the logic of the ``find_classes`` function
+    by default.
+    """
+    directory = os.path.expanduser(directory)
+
+    if class_to_idx is None:
+        _, class_to_idx = find_classes(directory)
+    elif not class_to_idx:
+        raise ValueError("'class_to_index' must have at least one entry to collect any samples.")
+
+    both_none = extensions is None and is_valid_file is None
+    both_something = extensions is not None and is_valid_file is not None
+    if both_none or both_something:
+        raise ValueError("Both extensions and is_valid_file cannot be None or not None at the same time")
+
+    if extensions is not None:
+
+        def is_valid_file(x: str) -> bool:
+            return has_file_allowed_extension(x, extensions)  # type: ignore[arg-type]
+
+    is_valid_file = cast(Callable[[str], bool], is_valid_file)
+
+    instances = []
+    available_classes = set()
+    for target_class in sorted(class_to_idx.keys()):
+        class_index = class_to_idx[target_class]
+        target_dir = os.path.join(directory, target_class)
+        if not mox.file.is_directory(target_dir):
+            continue
+        for root, _, fnames in sorted(mox.file.walk(target_dir, followlinks=True)):
+            for fname in sorted(fnames):
+                path = os.path.join(root, fname)
+                if is_valid_file(path):
+                    item = path, class_index
+                    instances.append(item)
+
+                    if target_class not in available_classes:
+                        available_classes.add(target_class)
+
+    empty_classes = set(class_to_idx.keys()) - available_classes
+    if empty_classes:
+        msg = f"Found no valid file for the classes {', '.join(sorted(empty_classes))}. "
+        if extensions is not None:
+            msg += f"Supported extensions are: {extensions if isinstance(extensions, str) else ', '.join(extensions)}"
+        raise FileNotFoundError(msg)
+
+    return instances
+
+def pil_loader(path: str) -> Image.Image:
+    # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
+    with open(path, "rb") as f:
+        img = Image.open(f)
+        return img.convert("RGB")
+
+def accimage_loader(path: str) -> Any:
+    import accimage
+
+    try:
+        return accimage.Image(path)
+    except OSError:
+        # Potentially a decoding problem, fall back to PIL.Image
+        return pil_loader(path)
+
+def default_loader(path: str) -> Any:
+    from torchvision import get_image_backend
+
+    if get_image_backend() == "accimage":
+        return accimage_loader(path)
+    else:
+        return pil_loader(path)
+
+
+
+class OurImageFolder(VisionDataset):
+    def __init__(
+            self,
+            root: str,
+            transform: Optional[Callable] = None,
+            target_transform: Optional[Callable] = None,
+            loader: Callable[[str], Any] = default_loader,
+            is_valid_file: Optional[Callable[[str], bool]] = None,
+            extensions: Optional[Tuple[str, ...]] = None,
+    ):
+        super().__init__(root, transform=transform, target_transform=target_transform)
+        classes, class_to_idx = self.find_classes(self.root)
+        samples = self.make_dataset(self.root, class_to_idx, extensions, is_valid_file)
+
+        self.loader = loader
+        self.extensions = extensions
+
+        self.classes = classes
+        self.class_to_idx = class_to_idx
+        self.samples = samples
+        self.targets = [s[1] for s in samples]
+        self.imgs = self.samples
+
+    @staticmethod
+    def make_dataset(
+            directory: str,
+            class_to_idx: Dict[str, int],
+            extensions: Optional[Tuple[str, ...]] = None,
+            is_valid_file: Optional[Callable[[str], bool]] = None,
+    ) -> List[Tuple[str, int]]:
+        if class_to_idx is None:
+            raise ValueError("The class_to_idx parameter cannot be None.")
+        return make_dataset(directory, class_to_idx, extensions=extensions, is_valid_file=is_valid_file)
+
+    def find_classes(self, directory: str) -> Tuple[List[str], Dict[str, int]]:
+        return find_classes(directory)
+
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        """
+        Args:
+            index (int): Index
+
+        Returns:
+            tuple: (sample, target) where target is class_index of the target class.
+        """
+        path, target = self.samples[index]
+        sample = self.loader(path)
+        if self.transform is not None:
+            sample = self.transform(sample)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return sample, target
+
 
 def center_crop_arr(pil_image, image_size):
     """
@@ -107,6 +271,36 @@ def center_crop_arr(pil_image, image_size):
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
+def sample(model, latent_size, device, diffusion, vae, checkpoint_dir, train_steps):
+    module = model.module
+    class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
+
+    # Create sampling noise:
+    n = len(class_labels)
+    z = torch.randn(n, 4, latent_size, latent_size, device=device)
+    y = torch.tensor(class_labels, device=device)
+
+    # Setup classifier-free guidance:
+    z = torch.cat([z, z], 0)
+    y_null = torch.tensor([1000] * n, device=device)
+    y = torch.cat([y, y_null], 0)
+    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+
+    # Sample images:
+    samples = diffusion.p_sample_loop(
+        module.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True,
+        device=device
+    )
+    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+    samples = vae.decode(samples / 0.18215).sample
+
+    # Save and display images:
+    image_dir = os.path.join(checkpoint_dir, 'samples')
+    if not os.path.exists(image_dir):
+        os.makedirs(image_dir)
+    save_image(samples, os.path.join(f'{image_dir}/{train_steps:07d}.png'), nrow=4, normalize=True,
+               value_range=(-1, 1))
+    model.module.train()
 
 def main(args):
     """
@@ -148,9 +342,9 @@ def main(args):
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank])
-    diffusion = create_diffusion(timestep_respacing="", )  # default: 1000 steps, linear noise schedule
+    diffusion = create_diffusion(timestep_respacing="", faster=args.faster, p2_gamma=args.p2_gamma, p2_k=args.p2_k)  # default: 1000 steps, linear noise schedule
     # vae = AutoencoderKL.from_pretrained(f"/home/kwang/zhouyukun/transformers/sd-vae-ft-ema").to(device)
-    vae = AutoencoderKL.from_pretrained(f"/home/zyk/huggingface/sd-vae-ft-ema").to(device)
+    vae = AutoencoderKL.from_pretrained(f"transformers/sd-vae-ft-ema").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
@@ -163,7 +357,7 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    dataset = OurImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -198,20 +392,19 @@ def main(args):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
+
+            if train_steps % args.sample_every == 0 and train_steps >= 0:
+                if rank == 0:
+                    sample(model, latent_size, device, diffusion, vae, checkpoint_dir, train_steps)
+                dist.barrier()
+
             x = x.to(device)
             y = y.to(device)
+            # print(y)
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            if not args.faster:
-                t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            else:
-                # faster training for dit
-                # pdb.set_trace()
-                sqrt_one_minus_alphas_bar = torch.from_numpy(diffusion.sqrt_one_minus_alphas_cumprod)
-                p = torch.tanh(1e6 * (torch.gradient(sqrt_one_minus_alphas_bar)[0] - 1e-4)) + 1
-                p = F.normalize(p, p=1, dim=0)
-                t = torch.multinomial(p, x.shape[0], replacement=True).to(device)
+            t = t_sample(diffusion, x.shape[0], args, device)
             model_kwargs = dict(y=y)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
@@ -240,34 +433,7 @@ def main(args):
                 start_time = time()
 
             # Save DiT checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                # generate image for visualze
-                model.eval()
-                class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
-
-                # Create sampling noise:
-                n = len(class_labels)
-                z = torch.randn(n, 4, latent_size, latent_size, device=device)
-                y = torch.tensor(class_labels, device=device)
-
-                # Setup classifier-free guidance:
-                z = torch.cat([z, z], 0)
-                y_null = torch.tensor([1000] * n, device=device)
-                y = torch.cat([y, y_null], 0)
-                model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
-
-                # Sample images:
-                samples = diffusion.p_sample_loop(
-                    model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True,
-                    device=device
-                )
-                samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-                samples = vae.decode(samples / 0.18215).sample
-
-                # Save and display images:
-                save_image(samples, os.path.join(f'{checkpoint_dir}/{train_steps:07d}.png'), nrow=4, normalize=True, value_range=(-1, 1))
-                model.train()
-
+            if train_steps % args.ckpt_every == 0 and train_steps >= 0:
                 if rank == 0:
                     checkpoint = {
                         "model": model.module.state_dict(),
@@ -279,9 +445,6 @@ def main(args):
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
-
-            if train_steps >= args.max_iter:
-                break
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -296,10 +459,10 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=64)
+    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=448)
+    parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
@@ -310,10 +473,16 @@ if __name__ == "__main__":
     parser.add_argument('--p2_k', type=float, default=1)
     parser.add_argument('--p2_gamma', type=float, default=0)
     parser.add_argument('--faster', action='store_true', help='Enable faster training', default=False)
+    parser.add_argument('--dual', action='store_true', help='Enable dual training', default=False)
 
-    parser.add_argument('--max_iter', type=int, default=450, help='Maximum number of iterations (K)')
+    parser.add_argument('--max_iter', type=int, default=600, help='Maximum number of iterations (K)')
+
+    # sample
+    parser.add_argument('--sample_every', type=int, default=5000, help='Sample every N iterations')
+    parser.add_argument("--cfg-scale",  type=float, default=1.5)
 
     args = parser.parse_args()
     args.max_iter = args.max_iter * 1000
+
 
     main(args)
