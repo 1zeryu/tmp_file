@@ -6,6 +6,8 @@ def inference(args, ckpt_dir, image_size, num_fid_samples, nproc_per_node, sampl
     # ckpt_list.remove('samples')
     print(ckpt_list)
     ckpt_list = sorted(ckpt_list, key=lambda x: x.split('-')[-1].split('.')[0])
+    # remove the element don't end with .pt
+    ckpt_list = [ckpt for ckpt in ckpt_list if ckpt.endswith('.pt')]
     import pdb;pdb.set_trace()
     ckpt_list = [os.path.join(ckpt_dir, ckpt) for ckpt in ckpt_list if ckpt.endswith('.pt')]
 
@@ -30,6 +32,7 @@ def fid(ckpt_dir, fid_script_path, fid_ref, model='DiT-XL/2', image_size=256, cf
     # list ckpt dir
     ckpt_list = os.listdir(ckpt_dir)
     ckpt_list = sorted(ckpt_list, key=lambda x: x.split('-')[-1].split('.')[0])
+    ckpt_list = [ckpt for ckpt in ckpt_list if ckpt.endswith('.pt')]
     import pdb; pdb.set_trace()
     ckpt_list = [os.path.join(ckpt_dir, ckpt) for ckpt in ckpt_list if ckpt.endswith('.pt')]
 
@@ -39,7 +42,7 @@ def fid(ckpt_dir, fid_script_path, fid_ref, model='DiT-XL/2', image_size=256, cf
         ckpt_step = os.path.basename(ckpt).split('.')[0]
         model = model.replace('/', '-')
         sample_path = f'{model}-{ckpt_step}-size-256-vae-ema-cfg-{cfg_scale}-seed-0'
-        sample_path = os.path.join('samples', sample_path)
+        sample_path = os.path.join(args.sample_dir, sample_path)
         sample_npz = sample_path + '.npz'
         log = sample_path + '.log'
         # run fid script
@@ -58,6 +61,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--cfg-scale', type=float, default=1)
     parser.add_argument('--faster', action='store_true', default=False)
+    parser.add_argument('--fid', action='store_true', default=False)
     args = parser.parse_args()
 
     if args.faster:
@@ -68,6 +72,8 @@ if __name__ == '__main__':
     if not os.path.exists(args.sample_dir):
         os.makedirs(args.sample_dir)
 
-    inference(args, args.ckpt_dir, args.image_size, args.num_fid_samples, args.nproc_per_node, args.sample_dir, args.model, args.faster)
-    fid(args.ckpt_dir, 'evaluations/evaluator.py', 'evaluations/ref/VIRTUAL_imagenet256_labeled.npz', args.model, args.image_size, args.cfg_scale)
+    if not args.fid:
+        inference(args, args.ckpt_dir, args.image_size, args.num_fid_samples, args.nproc_per_node, args.sample_dir, args.model, args.faster)
+    else:
+        fid(args.ckpt_dir, 'evaluations/evaluator.py', 'evaluations/ref/VIRTUAL_imagenet256_labeled.npz', args.model, args.image_size, args.cfg_scale)
 
